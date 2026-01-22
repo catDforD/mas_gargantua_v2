@@ -2,8 +2,8 @@ from __future__ import annotations
 
 import os
 
-from .config import PermissionConfig
 from ..core.schemas import PermissionDecision, PermissionResult
+from .config import PermissionConfig
 
 
 class PermissionManager:

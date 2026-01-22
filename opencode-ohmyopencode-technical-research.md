@@ -9,7 +9,8 @@
 - [OpenCode — 深度技术细节](#opencode---深度技术细节)
   - [MCP 实现](#mcp-实现)
   - [核心架构](#核心架构)
-  - [源码关键位置](#源码关键位置)
+  - [上下文管理](#上下文管理)
+  - [源码关键位置](#源码关键位置-2)
 - [Oh My OpenCode — 深度技术细节](#oh-my-opencode---深度技术细节)
   - [Agent 系统](#agent-系统)
   - [Specialized Agents 架构](#specialized-agents-架构)
@@ -191,6 +192,599 @@ case config.MCPSse:
 }
 ```
 
+### 上下文管理
+
+#### 核心概念
+
+OpenCode 的上下文管理系统是其 AI-native IDE 的核心组件，负责管理对话、文件、状态等多维度上下文信息。
+
+#### 架构设计
+
+##### 1. 四层内存架构
+
+```
+┌─────────────────────────────────────────────┐
+│         Global Context (全局层)              │
+│    系统级配置、跨项目设置、全局知识库         │
+├─────────────────────────────────────────────┤
+│          User Context (用户层)               │
+│    用户偏好、跨项目记忆、个人工作模式         │
+├─────────────────────────────────────────────┤
+│         Project Context (项目层)             │
+│    项目配置、代码库结构、文档索引             │
+├─────────────────────────────────────────────┤
+│        Session Context (会话层)              │
+│    当前对话、文件编辑历史、即时状态           │
+└─────────────────────────────────────────────┘
+```
+
+##### 2. 上下文类型分类
+
+| 类型 | 说明 | 持久化 | 示例 |
+|------|------|--------|------|
+| `conversation` | 对话历史 | 持久化 | 用户与 AI 的交互记录 |
+| `file` | 文件内容 | 持久化 | 打开的文件、编辑器状态 |
+| `selection` | 选区信息 | 临时 | 当前选中的代码片段 |
+| `state` | 应用状态 | 临时 | 光标位置、面板布局 |
+| `memory` | 记忆数据 | 持久化 | 学习到的模式和偏好 |
+
+#### 上下文数据结构
+
+```typescript
+interface Context {
+  id: string;                    // 唯一标识符
+  type: ContextType;             // 上下文类型
+  content: any;                  // 实际内容
+  timestamp: Date;               // 时间戳
+  metadata: {
+    source: string;              // 来源 (editor, user, tool, etc.)
+    importance: number;          // 重要性评分 (0-1)
+    relevanceScore: number;      // 关联性评分 (0-1)
+    ttl?: number;                // 生存时间 (临时上下文)
+    tags?: string[];             // 标签分类
+    parentId?: string;           // 父上下文 ID
+    sessionId?: string;          // 所属会话
+  };
+  relationships: ContextReference[];  // 关联的上下文
+}
+
+interface ContextReference {
+  targetId: string;              // 关联的上下文 ID
+  relationship: 'derived' | 'related' | 'contains' | 'depends_on';
+  weight: number;                // 关联强度 (0-1)
+}
+
+interface ContextWindow {
+  id: string;
+  contexts: string[];            // 上下文 ID 列表
+  maxTokens: number;             // 最大 token 数
+  currentTokens: number;         // 当前 token 消耗
+  priority: number;              // 窗口优先级
+}
+```
+
+#### 上下文管理核心流程
+
+```
+┌──────────┐    ┌──────────┐    ┌──────────┐    ┌──────────┐
+│ Capture  │ -> │ Process  │ -> │ Store    │ -> │ Retrieve │
+│ (捕获)   │    │ (处理)   │    │ (存储)   │    │ (检索)   │
+└──────────┘    └──────────┘    └──────────┘    └──────────┘
+     │               │               │               │
+     v               v               v               v
+  实时采集    过滤/增强/丰富    分层存储       语义搜索
+  用户输入    重要性排序       持久化          相关性匹配
+  文件变更    去重            缓存            优先级排序
+  工具输出    结构化          索引            窗口管理
+```
+
+#### 上下文捕获机制
+
+##### 1. 实时捕获源
+
+```typescript
+interface ContextCaptureConfig {
+  // 是否捕获编辑器上下文
+  editor: {
+    enabled: boolean;
+    captureOnChange: boolean;
+    captureOnSelection: boolean;
+    maxRecentFiles: number;
+  };
+
+  // 是否捕获对话上下文
+  conversation: {
+    enabled: boolean;
+    includeSystemPrompt: boolean;
+    maxMessages: number;
+    summarizeOlderThan: number;  // 秒
+  };
+
+  // 是否捕获工具执行上下文
+  tool: {
+    enabled: boolean;
+    captureInput: boolean;
+    captureOutput: boolean;
+    captureDuration: boolean;
+  };
+}
+```
+
+##### 2. 上下文过滤与优先级
+
+```typescript
+class ContextPrioritizer {
+  // 重要性评分算法
+  calculateImportance(context: Context): number {
+    let score = 0;
+
+    // 基于类型的权重
+    const typeWeights: Record<ContextType, number> = {
+      conversation: 0.3,
+      file: 0.5,
+      selection: 0.7,
+      state: 0.2,
+      memory: 0.4,
+    };
+    score += typeWeights[context.type] || 0;
+
+    // 基于来源的权重
+    const sourceWeights: Record<string, number> = {
+      user: 0.9,
+      editor: 0.7,
+      tool: 0.5,
+      system: 0.3,
+    };
+    score += sourceWeights[context.metadata.source] || 0;
+
+    // 衰减计算
+    const age = Date.now() - context.timestamp.getTime();
+    const decayFactor = Math.exp(-age / (24 * 60 * 60 * 1000));  // 24小时半衰期
+    score *= decayFactor;
+
+    return Math.min(1, Math.max(0, score));
+  }
+
+  // 上下文窗口管理
+  manageContextWindow(contexts: Context[], maxTokens: number): Context[] {
+    // 1. 按重要性排序
+    const sorted = contexts.sort((a, b) =>
+      this.calculateImportance(b) - this.calculateImportance(a)
+    );
+
+    // 2. 贪心选择
+    const selected: Context[] = [];
+    let currentTokens = 0;
+
+    for (const ctx of sorted) {
+      const ctxTokens = estimateTokenCount(ctx);
+      if (currentTokens + ctxTokens <= maxTokens) {
+        selected.push(ctx);
+        currentTokens += ctxTokens;
+      }
+    }
+
+    // 3. 溢出时标记需要摘要
+    if (selected.length < contexts.length) {
+      markForSummarization(contexts.slice(selected.length));
+    }
+
+    return selected;
+  }
+}
+```
+
+#### 上下文存储层
+
+##### 1. 分层存储架构
+
+```typescript
+interface ContextStorage {
+  // 内存缓存 (最快，临时)
+  memory: {
+    set(key: string, value: Context): void;
+    get(key: string): Context | null;
+    delete(key: string): void;
+    clear(): void;
+  };
+
+  // 会话存储 (中等速度，会话级持久化)
+  session: {
+    save(sessionId: string, contexts: Context[]): Promise<void>;
+    load(sessionId: string): Promise<Context[]>;
+    delete(sessionId: string): Promise<void>;
+  };
+
+  // 持久化存储 (最慢，跨会话)
+  persistent: {
+    save(context: Context): Promise<void>;
+    load(id: string): Promise<Context | null>;
+    search(query: SearchQuery): Promise<Context[]>;
+    delete(id: string): Promise<void>;
+  };
+
+  // 索引服务 (用于快速检索)
+  index: {
+    index(context: Context): Promise<void>;
+    search(query: string): Promise<string[]>;  // 返回上下文 ID
+    reindexAll(): Promise<void>;
+  };
+}
+```
+
+##### 2. 存储后端支持
+
+```typescript
+type StorageBackend =
+  | { type: 'memory' }
+  | { type: 'file'; path: string }
+  | { type: 'sqlite'; path: string }
+  | { type: 'postgres'; connectionString: string }
+  | { type: 'redis'; url: string };
+
+class ContextStore {
+  constructor(private backend: StorageBackend) {}
+
+  async save(context: Context): Promise<void> {
+    switch (this.backend.type) {
+      case 'memory':
+        return this.saveToMemory(context);
+      case 'file':
+        return this.saveToFile(context);
+      case 'sqlite':
+        return this.saveToSqlite(context);
+      // ...
+    }
+  }
+}
+```
+
+#### 上下文检索与检索增强生成 (RAG)
+
+##### 1. 语义检索
+
+```typescript
+class ContextRetriever {
+  constructor(
+    private embeddingService: EmbeddingService,
+    private vectorStore: VectorStore
+  ) {}
+
+  async retrieve(query: string, options: RetrievalOptions): Promise<Context[]> {
+    // 1. 生成查询嵌入
+    const queryEmbedding = await this.embeddingService.embed(query);
+
+    // 2. 向量搜索
+    const similar = await this.vectorStore.search(queryEmbedding, {
+      topK: options.topK || 10,
+      threshold: options.minScore || 0.7,
+    });
+
+    // 3. 过滤和排序
+    let results = await this.loadContexts(similar.map(s => s.id));
+
+    // 4. 应用时间衰减
+    if (options.recencyBoost) {
+      results = this.applyRecencyBoost(results, options.recencyBoost);
+    }
+
+    // 5. 限制结果数量
+    return results.slice(0, options.limit);
+  }
+
+  private applyRecencyBoost(contexts: Context[], boost: number): Context[] {
+    const now = Date.now();
+    return contexts.sort((a, b) => {
+      const aAge = now - a.timestamp.getTime();
+      const bAge = now - b.timestamp.getTime();
+      const aBoost = Math.exp(-aAge / boost);
+      const bBoost = Math.exp(-bAge / boost);
+      return bBoost - aBoost;
+    });
+  }
+}
+```
+
+##### 2. 混合检索策略
+
+```typescript
+interface HybridRetrievalConfig {
+  // 语义搜索权重
+  semanticWeight: number;
+
+  // 关键词搜索权重
+  keywordWeight: number;
+
+  // 精确匹配权重
+  exactWeight: number;
+
+  // 是否启用时间过滤
+  timeFilter?: {
+    enabled: boolean;
+    horizon: number;  // 考虑多近期的上下文
+  };
+}
+
+class HybridContextRetriever {
+  async retrieve(query: string, config: HybridRetrievalConfig): Promise<Context[]> {
+    // 并行执行多种检索
+    const [semanticResults, keywordResults, exactResults] = await Promise.all([
+      this.semanticSearch(query),
+      this.keywordSearch(query),
+      this.exactSearch(query),
+    ]);
+
+    // 融合结果
+    const fused = this.fuseResults(
+      semanticResults,
+      keywordResults,
+      exactResults,
+      config
+    );
+
+    return fused;
+  }
+}
+```
+
+#### 上下文压缩与摘要
+
+```typescript
+class ContextCompressor {
+  constructor(private llm: LLMService) {}
+
+  async compress(contexts: Context[], maxTokens: number): Promise<Context> {
+    // 1. 计算需要压缩的上下文量
+    const totalTokens = sum(contexts.map(estimateTokens));
+    const tokensToRemove = totalTokens - maxTokens;
+
+    // 2. 按时间排序，最旧的先压缩
+    const sorted = contexts.sort((a, b) =>
+      a.timestamp.getTime() - b.timestamp.getTime()
+    );
+
+    // 3. 批量压缩
+    const compressed: Context[] = [];
+    let currentTokens = 0;
+
+    for (const ctx of sorted) {
+      const ctxTokens = estimateTokens(ctx);
+      if (currentTokens + ctxTokens > maxTokens) {
+        const summary = await this.summarize([ctx]);
+        compressed.push(summary);
+        currentTokens += estimateTokens(summary);
+      } else {
+        compressed.push(ctx);
+        currentTokens += ctxTokens;
+      }
+    }
+
+    // 4. 合并为单一摘要上下文
+    return this.mergeIntoSummary(compressed);
+  }
+
+  private async summarize(contexts: Context[]): Promise<Context> {
+    const prompt = `请对以下上下文进行摘要，保留关键信息：
+
+${contexts.map(c => JSON.stringify(c.content)).join('\n\n')}`;
+
+    const summary = await this.llm.complete(prompt, {
+      maxTokens: 500,
+      temperature: 0.3,
+    });
+
+    return {
+      id: generateId(),
+      type: 'conversation',
+      content: { summary },
+      timestamp: new Date(),
+      metadata: {
+        source: 'compressor',
+        importance: 0.5,
+        relevanceScore: 1.0,
+        originalIds: contexts.map(c => c.id),
+      },
+      relationships: contexts.map(c => ({
+        targetId: c.id,
+        relationship: 'derived' as const,
+        weight: 1.0,
+      })),
+    };
+  }
+}
+```
+
+#### 状态同步与冲突解决
+
+```typescript
+interface ContextVersion {
+  id: string;
+  version: number;
+  content: any;
+  timestamp: Date;
+  source: string;
+}
+
+class ContextSynchronizer {
+  private versions: Map<string, ContextVersion[]> = new Map();
+
+  // 版本控制
+  updateContext(context: Context): ContextVersion {
+    const existing = this.versions.get(context.id) || [];
+    const newVersion: ContextVersion = {
+      id: context.id,
+      version: existing.length + 1,
+      content: context.content,
+      timestamp: context.timestamp,
+      source: context.metadata.source,
+    };
+    existing.push(newVersion);
+    this.versions.set(context.id, existing);
+    return newVersion;
+  }
+
+  // 冲突解决策略
+  async resolveConflict(
+    local: ContextVersion,
+    remote: ContextVersion
+  ): Promise<ContextVersion> {
+    // 策略 1: 时间戳优先
+    if (remote.timestamp > local.timestamp) {
+      return remote;
+    }
+
+    // 策略 2: 重要性优先
+    if (local.metadata.importance > remote.metadata.importance) {
+      return local;
+    }
+
+    // 策略 3: 合并（最后手段）
+    return this.mergeContexts(local, remote);
+  }
+
+  private mergeContexts(a: ContextVersion, b: ContextVersion): ContextVersion {
+    // 深度合并策略
+    return {
+      id: a.id,
+      version: Math.max(a.version, b.version) + 1,
+      content: deepMerge(a.content, b.content),
+      timestamp: new Date(),
+      source: 'merge',
+    };
+  }
+}
+```
+
+#### 对话历史管理
+
+```typescript
+class ConversationHistoryManager {
+  private messages: Message[] = [];
+  private summary: string | null = null;
+
+  async addMessage(role: 'user' | 'assistant' | 'system', content: string): Promise<void> {
+    this.messages.push({
+      role,
+      content,
+      timestamp: new Date(),
+    });
+
+    // 检查是否需要摘要
+    if (this.shouldSummarize()) {
+      await this.summarize();
+    }
+  }
+
+  private shouldSummarize(): boolean {
+    // 超过消息数量限制
+    if (this.messages.length > 50) return true;
+
+    // 超过 token 限制
+    if (estimateTokenCount(this.messages) > 64000) return true;
+
+    // 超过时间限制（24小时）
+    const oldest = this.messages[0].timestamp;
+    if (Date.now() - oldest.getTime() > 24 * 60 * 60 * 1000) return true;
+
+    return false;
+  }
+
+  async summarize(): Promise<string> {
+    // 使用 LLM 生成摘要
+    const prompt = `请对以下对话历史进行摘要，保留关键信息、决策和上下文：
+
+${this.messages.map(m => `[${m.role}]: ${m.content}`).join('\n\n')}`;
+
+    this.summary = await this.llm.complete(prompt, {
+      maxTokens: 2000,
+      temperature: 0.3,
+    });
+
+    // 保留摘要，删除旧消息（保留最近 5 条）
+    const recentCount = 5;
+    this.messages = this.messages.slice(-recentCount);
+
+    // 添加摘要消息
+    this.messages.unshift({
+      role: 'system',
+      content: `以下是对之前对话的摘要：\n${this.summary}`,
+      timestamp: new Date(),
+    });
+
+    return this.summary;
+  }
+
+  getContextForModel(maxTokens: number): Message[] {
+    // 如果有摘要，使用摘要 + 最近消息
+    if (this.summary) {
+      const summaryMsg: Message = {
+        role: 'system',
+        content: this.summary,
+        timestamp: new Date(),
+      };
+
+      const result: Message[] = [summaryMsg];
+      let currentTokens = estimateTokenCount(summaryMsg);
+
+      // 逆向添加最近消息
+      for (let i = this.messages.length - 1; i >= 0; i--) {
+        const msg = this.messages[i];
+        const msgTokens = estimateTokenCount(msg);
+        if (currentTokens + msgTokens <= maxTokens) {
+          result.push(msg);
+          currentTokens += msgTokens;
+        }
+      }
+
+      return result;
+    }
+
+    // 否则直接截断
+    return this.truncateMessages(this.messages, maxTokens);
+  }
+}
+```
+
+#### 上下文事件系统
+
+```typescript
+type ContextEventType =
+  | 'context.created'
+  | 'context.updated'
+  | 'context.deleted'
+  | 'context.queried'
+  | 'context.summarized'
+  | 'context.window.full';
+
+interface ContextEvent {
+  type: ContextEventType;
+  contextId: string;
+  timestamp: Date;
+  data?: any;
+}
+
+class ContextEventEmitter extends EventEmitter {
+  // 上下文变更事件
+  onContextCreated(callback: (event: ContextEvent) => void): void {
+    this.on('context.created', callback);
+  }
+
+  onContextUpdated(callback: (event: ContextEvent) => void): void {
+    this.on('context.updated', callback);
+  }
+
+  // 触发事件
+  private emitContextEvent(type: ContextEventType, contextId: string, data?: any): void {
+    this.emit(type, {
+      type,
+      contextId,
+      timestamp: new Date(),
+      data,
+    });
+  }
+}
+```
+
 ### 核心架构
 
 #### 客户端/服务器分离
@@ -231,6 +825,7 @@ case config.MCPSse:
 | Schema 定义 | `opencode-schema.json` |
 | 启动入口 | `cmd/root.go` |
 | 服务器 | `internal/server/server.go` |
+| 上下文管理 | `packages/core/src/context/` |
 
 ---
 
@@ -820,6 +1415,10 @@ editErrorRecovery → delegateTaskRetry → commentChecker → toolOutputTruncat
 | Hooks 入口 | `src/hooks/claude-code-hooks/index.ts` |
 | Plugin 主入口 | `src/index.ts` |
 | Hooks 文档 | `src/hooks/AGENTS.md` |
+| 上下文类型 | `packages/core/src/context/types.ts` |
+| 上下文存储 | `packages/core/src/context/storage.ts` |
+| 上下文检索 | `packages/core/src/context/retriever.ts` |
+| 对话历史 | `packages/core/src/context/conversation.ts` |
 
 ---
 
@@ -847,6 +1446,7 @@ editErrorRecovery → delegateTaskRetry → commentChecker → toolOutputTruncat
 2. **插件架构**：OpenAPI 3.1 规范 + SDK 生成，易于扩展
 3. **权限系统**：细粒度权限控制，支持 allow/ask/deny 三种模式
 4. **多客户端支持**：TUI、桌面应用、IDE 扩展，通过本地服务器统一接口
+5. **上下文管理**：四层内存架构（Global → User → Project → Session），语义检索，上下文压缩，版本控制
 
 ### Oh My OpenCode 核心能力
 1. **多 Agent 系统**：专业化 Agent（Sisyphus, Oracle, Librarian, Explore 等），明确的分工
@@ -861,6 +1461,31 @@ editErrorRecovery → delegateTaskRetry → commentChecker → toolOutputTruncat
 - **并发控制**：精细的并发管理，避免资源耗尽
 - **权限保护**：多层权限检查，hook 拦截机制
 - **文档驱动**：OpenAPI 规范，自动化 SDK 生成
+- **智能上下文**：分层存储、语义检索、上下文压缩、冲突解决
+
+### MAS_V2 可借鉴的设计
+
+基于 OpenCode 的上下文管理实现，MAS_V2 可以考虑：
+
+1. **四层上下文架构**
+   - Task-level（任务级，临时）
+   - Workflow-level（工作流级，会话）
+   - Agent-level（智能体级，持久化）
+   - System-level（系统级，跨会话）
+
+2. **上下文压缩机制**
+   - 滑动窗口管理
+   - 重要性评分
+   - 自动摘要生成
+
+3. **混合检索策略**
+   - 语义搜索 + 关键词搜索
+   - 相关性 + 时间衰减
+
+4. **版本控制与冲突解决**
+   - 乐观锁策略
+   - 时间戳/重要性优先
+   - 深度合并
 
 ---
 

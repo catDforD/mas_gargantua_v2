@@ -37,6 +37,7 @@ mas/
 ├── agents/         # Agent pool and implementations by capability
 ├── workflow/       # Workflow factory, decomposer, and templates
 ├── execution/      # Execution engine, scheduler, runner
+├── context/        # Hierarchical context management (NEW)
 ├── permissions/    # Tool and resource level permission management
 ├── hooks/          # Hook system (pre/post tool use, on error)
 ├── tools/          # MCP tool integration and builtin tools
@@ -56,11 +57,14 @@ Task Description → Classification → WorkflowFactory → AgentPool.select()
                                   ExecutionEngine
                                          ↓
                              PreToolUse → Tool → PostToolUse
+                                         ↓
+                             ContextManager (context storage & retrieval)
 ```
 
 ### Key Components
 
 - **AgentPool** (`agents/pool.py`): Singleton registry managing agents by capability
+- **ContextManager** (`context/manager.py`): Hierarchical context storage with scoring and compression
 - **WorkflowFactory** (`workflow/factory.py`): Creates workflows from templates or LLM
 - **ExecutionEngine** (`execution/engine.py`): Runs workflows with hook integration
 - **HookManager** (`hooks/manager.py`): Chain-of-responsibility for pre/post tool hooks
@@ -122,6 +126,56 @@ Built-in hooks in `hooks/builtin/`:
 - `permission_check.py` - Permission validation
 - `input_validation.py` - Parameter validation
 - `audit_log.py` - Logging
+
+## Context Management System
+
+### Four-Layer Architecture
+
+```
+┌─────────────────────────────────────────────┐
+│         System Context (Level 0)             │
+│    Global config, agent pool metadata        │
+├─────────────────────────────────────────────┤
+│          Workflow Context (Level 1)          │
+│    Task description, shared state            │
+├─────────────────────────────────────────────┤
+│            Task Context (Level 2)            │
+│    Dependency outputs, tool results          │
+├─────────────────────────────────────────────┤
+│           Agent Context (Level 3)            │
+│    Tool history, error recovery state        │
+└─────────────────────────────────────────────┘
+```
+
+### Context Types
+
+Defined in `context/types.py` - `ContextType` enum:
+- `DEPENDENCY_OUTPUT` - Output from dependent tasks
+- `SHARED_STATE` - Cross-task shared variables
+- `TOOL_RESULT` - Results from tool calls
+- `LLM_RESPONSE` - Agent LLM responses
+- `ERROR_CONTEXT` - Error recovery information
+- `CONFIGURATION` - Runtime configurations
+
+### Key Classes
+
+- **ContextManager** (`context/manager.py`): Main interface for context operations
+- **ContextStore** (`context/store.py`): Layered storage with O(1) ID lookup
+- **ContextScorer** (`context/scorer.py`): Importance and relevance scoring
+- **ContextWindow** (`context/window.py`): Token budget management
+- **ContextCompressor** (`context/compression.py`): LLM summarization with smart truncation
+
+### Scoring Algorithm
+
+```
+Score = importance * 0.4 + relevance_score * 0.3 + recency * 0.2 + frequency * 0.1
+```
+
+Where:
+- `importance`: Based on context type (ERROR_CONTEXT=0.9, DEPENDENCY_OUTPUT=0.8, etc.)
+- `relevance_score`: 1.0 for dependency outputs, 0.9 for related entries
+- `recency`: Time decay with 1-hour half-life
+- `frequency`: Access count (capped at 10)
 
 ## Testing
 

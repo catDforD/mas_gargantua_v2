@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Callable
+from collections.abc import Callable
 
 from ...core.schemas import TaskCategory, WorkflowTemplate
 from .data_pipeline import build_template as data_pipeline_template

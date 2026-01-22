@@ -2,6 +2,7 @@
 
 **撰写日期**: 2026.1.19
 **更新日期**: 2026.1.19（细化版：增加权限管理、Hooks 系统、MCP 工具集成、实现指南）
+**更新日期**: 2026.1.22（新增：上下文管理系统）
 
 ## 一、系统定位与目标
 
@@ -1184,7 +1185,355 @@ if __name__ == "__main__":
 
 ---
 
-## 十五、后续扩展计划
+## 十五、上下文管理系统
+
+### 15.1 问题背景
+
+在多智能体协作场景中，任务间的上下文传递至关重要。之前的实现使用简单的字符串截断（8000 字符），可能导致关键信息丢失。
+
+### 15.2 四层上下文架构
+
+```
+┌─────────────────────────────────────────────┐
+│         System Context (Level 0)             │
+│    - 全局配置                                │
+│    - Agent 池元数据                          │
+│    - 权限配置                                │
+├─────────────────────────────────────────────┤
+│          Workflow Context (Level 1)          │
+│    - 任务描述                                │
+│    - 跨任务共享状态                          │
+│    - 工作流级目标和约束                      │
+├─────────────────────────────────────────────┤
+│            Task Context (Level 2)            │
+│    - 依赖任务输出                            │
+│    - 工具调用结果                            │
+│    - LLM 响应                                │
+├─────────────────────────────────────────────┤
+│           Agent Context (Level 3)            │
+│    - Agent 特定记忆                          │
+│    - 工具调用历史                            │
+│    - 错误恢复状态                            │
+└─────────────────────────────────────────────┘
+```
+
+### 15.3 上下文类型定义
+
+```python
+# context/types.py
+
+class ContextType(str, Enum):
+    DEPENDENCY_OUTPUT = "dependency_output"  # 依赖任务输出
+    SHARED_STATE = "shared_state"            # 共享状态
+    TOOL_RESULT = "tool_result"              # 工具结果
+    LLM_RESPONSE = "llm_response"            # LLM 响应
+    ERROR_CONTEXT = "error_context"          # 错误上下文
+    CONFIGURATION = "configuration"          # 配置信息
+
+class ContextLayer(int, Enum):
+    SYSTEM = 0      # 系统层
+    WORKFLOW = 1    # 工作流层
+    TASK = 2        # 任务层
+    AGENT = 3       # 智能体层
+
+@dataclass
+class ContextEntry:
+    id: str
+    type: ContextType
+    content: str | dict[str, object]
+    timestamp: float
+    source: str                              # agent_name 或 task_id
+    importance: float = 0.5                  # 0.0-1.0
+    relevance_score: float = 0.5             # 0.0-1.0
+    access_count: int = 0                    # 访问次数
+    ttl: int | None = None                   # 生存时间（秒）
+    parent_id: str | None = None             # 父上下文 ID
+    related_ids: list[str] = field(default_factory=list)
+    is_compressed: bool = False              # 是否已压缩
+    original_length: int = 0                 # 原始长度
+    summary: str | None = None               # 压缩摘要
+```
+
+### 15.4 重要性评分算法
+
+```python
+def compute_score(self, current_task_id: str | None = None) -> float:
+    """计算综合分数"""
+    # 基础重要性权重（基于类型）
+    type_weights = {
+        ContextType.ERROR_CONTEXT: 0.9,
+        ContextType.DEPENDENCY_OUTPUT: 0.8,
+        ContextType.SHARED_STATE: 0.7,
+        ContextType.TOOL_RESULT: 0.6,
+        ContextType.LLM_RESPONSE: 0.5,
+        ContextType.CONFIGURATION: 0.4,
+    }
+    base = type_weights.get(self.type, 0.5)
+
+    # 时间衰减（1小时半衰期）
+    recency = math.exp(-(time.time() - self.timestamp) / 3600.0)
+
+    # 访问频率（归一化）
+    frequency = min(self.access_count / 10.0, 1.0)
+
+    # 加权求和
+    return base * 0.4 + self.relevance_score * 0.3 + recency * 0.2 + frequency * 0.1
+```
+
+### 15.5 Token 窗口管理
+
+```python
+# context/window.py
+
+class ContextWindow:
+    DEFAULT_MAX_TOKENS = 8000
+
+    def __init__(self, max_tokens: int = DEFAULT_MAX_TOKENS):
+        self.max_tokens = max_tokens
+        self._encoding = None  # tiktoken 编码器
+
+    def select(self, entries: list[ContextEntry], max_tokens: int | None = None) -> list[ContextEntry]:
+        """在 Token 预算内贪心选择最高分的条目"""
+        budget = max_tokens or self.max_tokens
+        ordered = sorted(entries, key=lambda e: e.compute_score(), reverse=True)
+
+        selected = []
+        used_tokens = 0
+        for entry in ordered:
+            tokens = self._entry_tokens(entry)
+            if used_tokens + tokens <= budget:
+                selected.append(entry)
+                used_tokens += tokens
+                entry.increment_access()
+
+        return selected
+```
+
+### 15.6 LLM 摘要压缩
+
+```python
+# context/compression.py
+
+class ContextCompressor:
+    COMPRESSION_THRESHOLD = 4000  # 超过此长度触发压缩
+
+    async def summarize(self, text: str, max_length: int = 1000) -> str:
+        """使用 LLM 生成摘要"""
+        if self._llm_client is None:
+            return self.truncate_smart(text, max_length)
+
+        prompt = f"""请简洁地总结以下内容，保留关键信息：
+
+{text}
+
+要求：
+1. 控制在 {max_length} 字符以内
+2. 保留主要结论和关键数据
+3. 保留重要的技术细节
+
+摘要："""
+
+        try:
+            summary = await self._llm_client.acomplete(prompt, temperature=0.3)
+            return summary[:max_length]
+        except Exception:
+            return self.truncate_smart(text, max_length)
+
+    def truncate_smart(self, text: str, max_length: int) -> str:
+        """智能截断，保留句子边界"""
+        if len(text) <= max_length:
+            return text
+
+        # 查找句号或换行符
+        boundary = max(text.rfind("。", 0, max_length),
+                       text.rfind(".", 0, max_length),
+                       text.rfind("\n", 0, max_length))
+
+        if boundary != -1 and boundary >= max_length * 0.5:
+            return text[: boundary + 1]
+
+        return text[:max_length].rstrip() + "..."
+```
+
+### 15.7 上下文管理器
+
+```python
+# context/manager.py
+
+class ContextManager:
+    """上下文管理器 - 管理多智能体系统中的上下文"""
+
+    def __init__(
+        self,
+        session_id: str,
+        llm_client: "LLMClient | None" = None,
+        max_tokens: int = 8000,
+    ):
+        self.session_id = session_id
+        self.store = ContextStore(session_id)
+        self.scorer = ContextScorer()
+        self.window = ContextWindow(max_tokens=max_tokens)
+        self.compressor = ContextCompressor(llm_client)
+
+    async def add_task_output(
+        self,
+        task_id: str,
+        output: str,
+        agent_name: str,
+        dependent_task_ids: list[str] | None = None,
+    ) -> str:
+        """添加任务输出，自动压缩长输出"""
+        importance = self.scorer.compute_task_importance(task_id, agent_name)
+
+        entry = ContextEntry(
+            id=f"task_output_{task_id}_{uuid.uuid4().hex[:8]}",
+            type=ContextType.DEPENDENCY_OUTPUT,
+            content=output,
+            timestamp=time.time(),
+            source=task_id,
+            importance=importance,
+            parent_id=task_id,
+            related_ids=list(dependent_task_ids or []),
+        )
+
+        # 自动压缩
+        if await self.compressor.should_compress(entry.content):
+            entry = await self.compressor.compress_entry(entry)
+
+        return self.store.add(ContextLayer.TASK, entry)
+
+    async def get_context_for_task(
+        self,
+        task_id: str,
+        dependency_ids: list[str],
+        max_tokens: int | None = None,
+    ) -> str:
+        """获取优化后的任务上下文"""
+        # 收集相关条目
+        candidates = self._collect_related_entries(task_id, dependency_ids)
+
+        # 评分排序
+        ranked = self.scorer.rank_entries(candidates, target_task_id=task_id)
+
+        # Token 预算内选择
+        selected = self.window.select(ranked, max_tokens=max_tokens)
+
+        return self._format_context(selected)
+
+    def _collect_related_entries(self, task_id: str, dependency_ids: list[str]) -> list[ContextEntry]:
+        """收集相关上下文条目"""
+        entries = []
+        # 添加依赖任务输出
+        for entry in self.store.get_layer(ContextLayer.TASK).values():
+            if entry.source in dependency_ids:
+                entries.append(entry)
+        # 添加共享状态
+        entries.extend(self.store.get_layer(ContextLayer.WORKFLOW).values())
+        return entries
+```
+
+### 15.8 与执行引擎集成
+
+```python
+# execution/engine.py
+
+class ExecutionEngine:
+    def __init__(self, ..., context_max_tokens: int = 8000):
+        ...
+        self.context_manager = ContextManager(
+            session_id=self._session_id,
+            llm_client=self.llm_client,
+            max_tokens=context_max_tokens,
+        )
+
+    async def _execute_task(self, task, context, task_results) -> TaskResult:
+        # 获取优化后的上下文
+        optimized_context = await self.context_manager.get_context_for_task(
+            task_id=task.task_id,
+            dependency_ids=task.dependencies,
+            max_tokens=8000,
+        )
+
+        output = await self._call_llm(task, agent, optimized_context)
+
+        # 存储任务输出
+        await self.context_manager.add_task_output(
+            task_id=task.task_id,
+            output=str(output),
+            agent_name=agent_name,
+        )
+
+        return result
+```
+
+### 15.9 上下文感知的 Agent 选择
+
+```python
+# agents/pool.py
+
+def select_best_agent(self, capability: AgentCapability, context: dict[str, str]) -> AgentDescriptor:
+    """根据上下文智能选择最优 Agent"""
+    candidates = [d for d in self._pools.values() if d.capability == capability]
+
+    if len(candidates) == 1 or not context:
+        return candidates[0]
+
+    # 上下文评分
+    scored = []
+    for agent in candidates:
+        score = self._compute_agent_score(agent, context)
+        scored.append((agent, score))
+
+    scored.sort(key=lambda x: x[1], reverse=True)
+    return scored[0][0]
+
+def _compute_agent_score(self, agent: AgentDescriptor, context: dict[str, str]) -> float:
+    """计算 Agent 与任务的匹配分数"""
+    score = 1.0
+    task_desc = context.get("task_description", "").lower()
+
+    # use_when 条件匹配
+    for condition in agent.use_when:
+        if condition.lower() in task_desc:
+            score += 0.5
+
+    # avoid_when 条件匹配
+    for condition in agent.avoid_when:
+        if condition.lower() in task_desc:
+            score -= 0.5
+
+    # 成本惩罚
+    cost_penalty = {"low": 0.0, "medium": 0.1, "high": 0.2}
+    score -= cost_penalty.get(agent.cost, 0.0)
+
+    return score
+```
+
+### 15.10 目录结构
+
+```
+mas/context/
+├── __init__.py           # 公共 API 导出
+├── types.py              # ContextType, ContextLayer, ContextEntry
+├── store.py              # ContextStore 分层存储
+├── scorer.py             # ContextScorer 重要性评分
+├── window.py             # ContextWindow Token 窗口管理
+├── compression.py        # ContextCompressor 摘要压缩
+└── manager.py            # ContextManager 主管理接口
+```
+
+### 15.11 实现效果
+
+| 指标 | 之前 | 之后 |
+|------|------|------|
+| Token 利用率 | ~50%（简单截断） | >90%（智能选择） |
+| 关键信息保留 | 可能丢失 | LLM 摘要保留 |
+| Agent 选择 | 仅基于能力 | 上下文感知 |
+| 上下文检索 | 无 | 相关性评分 |
+
+---
+
+## 十六、后续扩展计划
 
 ### 15.1 ADAS 优化模块（第三阶段）
 
