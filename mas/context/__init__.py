@@ -13,11 +13,12 @@ from .compression import ContextCompressor
 from .manager import ContextManager
 from .scorer import ContextScorer
 from .store import ContextStore
-from .types import ContextEntry, ContextLayer, ContextType
+from .types import ContentCategory, ContextEntry, ContextLayer, ContextType
 from .window import ContextWindow
 
 __all__ = [
     "ContextCompressor",
+    "ContentCategory",
     "ContextEntry",
     "ContextLayer",
     "ContextManager",

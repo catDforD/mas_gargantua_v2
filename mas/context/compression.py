@@ -1,10 +1,11 @@
 from __future__ import annotations
 
 import json
+import re
 from dataclasses import replace
 from typing import TYPE_CHECKING
 
-from .types import ContextEntry
+from .types import ContentCategory, ContextEntry
 
 if TYPE_CHECKING:
     from ..llm.client import LLMClient
@@ -26,6 +27,27 @@ class ContextCompressor:
 摘要："""
 
     COMPRESSION_THRESHOLD = 4000
+
+    CODE_PATTERNS = [
+        r"^```\w+",
+        r"^def\s+\w+",
+        r"^class\s+\w+",
+        r"^import\s+",
+        r"^from\s+",
+        r"^\s*if\s+__name__",
+        r"^\s*\w+\s*=\s*\(",
+    ]
+
+    CODE_BLOCK_MARKERS = [
+        "```python",
+        "```js",
+        "```java",
+        "```ts",
+        "```go",
+        "```rust",
+        "```cpp",
+        "```sql",
+    ]
 
     def __init__(self, llm_client: LLMClient | None = None):
         self._llm_client = llm_client
@@ -89,15 +111,59 @@ class ContextCompressor:
         truncated = text[:max_length].rstrip()
         return f"{truncated}..."
 
-    async def should_compress(self, content: str | dict[str, object]) -> bool:
+    def detect_content_category(self, content: str) -> ContentCategory:
+        """Detect if content is code, document, or mixed."""
+
+        if not content:
+            return ContentCategory.DOCUMENT
+
+        lines = content.splitlines()
+        has_code_marker = any(marker in content for marker in self.CODE_BLOCK_MARKERS)
+        if has_code_marker:
+            in_block = False
+            outside_text = False
+            for line in lines:
+                stripped = line.strip()
+                if stripped.startswith("```"):
+                    in_block = not in_block
+                    continue
+                if not in_block and stripped:
+                    outside_text = True
+                    break
+            return ContentCategory.MIXED if outside_text else ContentCategory.CODE
+
+        non_empty_lines = [line for line in lines if line.strip()]
+        if not non_empty_lines:
+            return ContentCategory.DOCUMENT
+
+        pattern_hits = 0
+        for line in non_empty_lines:
+            if any(re.match(pattern, line) for pattern in self.CODE_PATTERNS):
+                pattern_hits += 1
+
+        if pattern_hits == 0:
+            return ContentCategory.DOCUMENT
+        if pattern_hits == len(non_empty_lines):
+            return ContentCategory.CODE
+        return ContentCategory.MIXED
+
+    async def should_compress(
+        self,
+        content: str | dict[str, object],
+        content_category: ContentCategory | None = None,
+    ) -> bool:
         """判断内容长度是否超过压缩阈值。
 
         Args:
             content: 待检测内容。
+            content_category: 内容类别（用于跳过代码压缩）。
 
         Returns:
             bool: 是否需要压缩。
         """
+
+        if content_category == ContentCategory.CODE:
+            return False
 
         text = self._stringify(content)
         return len(text) >= self.COMPRESSION_THRESHOLD

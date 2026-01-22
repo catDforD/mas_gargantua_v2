@@ -3,12 +3,13 @@ from __future__ import annotations
 import json
 import time
 import uuid
+from pathlib import Path
 from typing import TYPE_CHECKING
 
 from .compression import ContextCompressor
 from .scorer import ContextScorer
 from .store import ContextStore
-from .types import ContextEntry, ContextLayer, ContextType
+from .types import ContentCategory, ContextEntry, ContextLayer, ContextType
 from .window import ContextWindow
 
 if TYPE_CHECKING:
@@ -47,6 +48,8 @@ class ContextManager:
         output: str,
         agent_name: str,
         dependent_task_ids: list[str] | None = None,
+        force_category: ContentCategory | None = None,
+        code_file_paths: list[str] | None = None,
     ) -> str:
         """添加任务输出到上下文。
 
@@ -57,6 +60,8 @@ class ContextManager:
             output: 任务输出内容。
             agent_name: 执行任务的 Agent 名称。
             dependent_task_ids: 依赖此任务的其他任务 ID。
+            force_category: 强制指定内容类别。
+            code_file_paths: 额外的代码文件路径列表。
 
         Returns:
             str: 创建的上下文条目 ID。
@@ -64,6 +69,17 @@ class ContextManager:
 
         importance = self.scorer.compute_task_importance(task_id, agent_name)
         related = list(dependent_task_ids or [])
+        content_category = force_category or self.compressor.detect_content_category(output)
+        # 使用传入的代码文件路径，或自动保存
+        code_file_path = None
+        if code_file_paths:
+            # 使用第一个代码文件作为主引用
+            code_file_path = code_file_paths[0] if code_file_paths else None
+        elif (
+            content_category == ContentCategory.CODE
+            and len(output) >= self.compressor.COMPRESSION_THRESHOLD
+        ):
+            code_file_path = await self.save_code_to_file(task_id, output)
         entry = ContextEntry(
             id=self._generate_entry_id(ContextType.DEPENDENCY_OUTPUT, task_id),
             type=ContextType.DEPENDENCY_OUTPUT,
@@ -73,9 +89,14 @@ class ContextManager:
             importance=importance,
             parent_id=task_id,
             related_ids=related,
+            content_category=content_category,
+            code_file_path=code_file_path,
         )
 
-        if await self.compressor.should_compress(entry.content):
+        if await self.compressor.should_compress(
+            entry.content,
+            content_category=content_category,
+        ):
             entry = await self.compressor.compress_entry(entry)
 
         return self.store.add(ContextLayer.TASK, entry)
@@ -126,7 +147,8 @@ class ContextManager:
         """
 
         dependency_set = set(dependency_ids)
-        task_layer_entries = self.store.get_layer(ContextLayer.TASK).values()
+        task_layer_entries = list(self.store.get_layer(ContextLayer.TASK).values())
+
         dependency_entries: list[ContextEntry] = []
         for entry in task_layer_entries:
             if self._is_dependency_entry(entry, dependency_set):
@@ -166,6 +188,20 @@ class ContextManager:
         for entry in entries:
             formatted_content = self._stringify(entry)
             header = f"- 来源 {entry.source} | 重要性 {entry.importance:.2f}\n{formatted_content}"
+
+            # 如果有代码文件，添加文件路径和内容
+            if entry.code_file_path:
+                from pathlib import Path
+                code_path = Path(entry.code_file_path)
+                if code_path.exists():
+                    code_content = code_path.read_text(encoding="utf-8")
+                    header += f"\n\n[代码文件: {code_path.name}]\n```python\n{code_content}\n```"
+                    # 添加其他代码文件（如果有）
+                    parent_dir = code_path.parent
+                    for f in parent_dir.iterdir():
+                        if f.name.endswith('.py') and f.name != code_path.name:
+                            header += f"\n\n[代码文件: {f.name}]\n```python\n{f.read_text(encoding='utf-8')}\n```"
+
             if entry.type == ContextType.SHARED_STATE:
                 shared_sections.append(header)
             elif entry.type == ContextType.DEPENDENCY_OUTPUT or entry.type == ContextType.ERROR_CONTEXT:
@@ -218,6 +254,43 @@ class ContextManager:
             entry = await self.compressor.compress_entry(entry)
 
         return self.store.add(ContextLayer.TASK, entry)
+
+    async def save_code_to_file(
+        self,
+        task_id: str,
+        code: str,
+        filename: str | None = None,
+        extension: str = ".py",
+    ) -> str:
+        """保存代码到文件并返回路径。
+
+        Args:
+            task_id: 任务 ID。
+            code: 代码内容。
+            filename: 文件名（可选）。
+            extension: 文件扩展名。
+
+        Returns:
+            str: 保存后的文件路径。
+        """
+
+        output_dir = Path("output") / f"session_{self.session_id}"
+        output_dir.mkdir(parents=True, exist_ok=True)
+        if filename:
+            safe_name = Path(filename).name
+        else:
+            safe_name = f"{task_id}{extension}"
+        file_path = output_dir / safe_name
+        file_path.write_text(code, encoding="utf-8")
+        return str(file_path)
+
+    async def update_code_path(self, task_id: str, code_file_path: str) -> bool:
+        """更新任务输出的代码文件路径。"""
+        for entry in self.store.get_layer(ContextLayer.TASK).values():
+            if entry.source == task_id and entry.type == ContextType.DEPENDENCY_OUTPUT:
+                entry.code_file_path = code_file_path
+                return True
+        return False
 
     def clear_task_context(self) -> int:
         """清空任务层上下文。返回清除的条目数。"""

@@ -67,6 +67,9 @@ class ExecutionEngine:
         tracker = ExecutionTracker(session_id)
         logger = get_logger("mas.execution")
 
+        # 自动注册所有内置 Agent
+        self._register_builtin_agents(agent_pool)
+
         self.llm_client: LLMClient = llm_client
         self.hook_manager: HookManager = hook_manager
         self.permission_manager: PermissionManager = permission_manager
@@ -233,6 +236,7 @@ class ExecutionEngine:
             return result
 
         # Execute LLM call
+        saved_code_paths: list[str] = []
         try:
             # Get optimized context from ContextManager
             optimized_context = await self.context_manager.get_context_for_task(
@@ -242,6 +246,14 @@ class ExecutionEngine:
             )
 
             output = await self._call_llm(task, agent, optimized_context)
+            code_blocks = self._extract_code_blocks(output)
+            for filename, code_content in code_blocks.items():
+                file_path = await self.context_manager.save_code_to_file(
+                    task.task_id,
+                    code_content,
+                    filename=filename,
+                )
+                saved_code_paths.append(file_path)
         except Exception as e:
             # Store error context
             await self.context_manager.add_error_context(
@@ -301,13 +313,14 @@ class ExecutionEngine:
             task_id=task.task_id,
             output=str(output),
             agent_name=agent_name,
+            code_file_paths=saved_code_paths if saved_code_paths else None,
         )
 
         result = TaskResult(
             task_id=task.task_id,
             success=True,
             output=output,
-            metadata={"agent": agent_name},
+            metadata={"agent": agent_name, "context": optimized_context},
             start_time=start_time,
             end_time=time.time(),
             agent_name=agent_name,
@@ -347,7 +360,14 @@ class ExecutionEngine:
 ## 当前任务:
 {task.objective}
 
-请基于上述上下文（如果有）完成当前任务，并提供你的回答。"""
+请基于上述上下文（如果有）完成当前任务。
+
+## 重要：如果你的回答包含代码，请使用以下格式标记：
+```
+%%CODE: filename.py%%
+[代码内容]
+```
+这样代码会被自动保存到文件供后续任务使用。"""
 
         self.tracker.log_llm_request(task.task_id, agent_name, prompt)
         try:
@@ -373,6 +393,33 @@ class ExecutionEngine:
     @staticmethod
     def _ignore_hook_result(_result: object) -> None:
         return None
+
+    def _extract_code_blocks(self, response: str) -> dict[str, str]:
+        """Extract code blocks marked with %%CODE: filename%%.
+
+        Only extracts content within ```python ... ``` code fences.
+        """
+        import re
+
+        result: dict[str, str] = {}
+
+        # Pattern to find %%CODE: filename%% followed by code in ```python blocks
+        code_block_pattern = r"%%CODE:\s*(\S+?)%%\s*\n```\w*\s*\n([\s\S]*?)\n```"
+
+        for match in re.finditer(code_block_pattern, response):
+            filename, code = match.groups()
+            result[filename.strip()] = code.strip()
+
+        # If no code blocks found with markers, try to extract any python code blocks
+        if not result:
+            plain_pattern = r"%%CODE:\s*(\S+?)%%\s*\n([\s\S]*?)(?=\n\n## |\n\n\* |```|\Z)"
+            for match in re.finditer(plain_pattern, response):
+                filename, code = match.groups()
+                # Validate it's likely Python code (contains common keywords)
+                if any(kw in code for kw in ["import ", "def ", "class ", "from ", "#"]):
+                    result[filename.strip()] = code.strip()
+
+        return result
 
     def _get_total_duration_ms(self) -> float | None:
         for record in reversed(self.tracker.records):
@@ -417,3 +464,30 @@ class ExecutionEngine:
         if len(output) <= 50:
             return output
         return f"{output[:50]}..."
+
+    @staticmethod
+    def _register_builtin_agents(registry: AgentPoolRegistry) -> None:
+        """注册所有内置 Agent 到注册表（已注册的不重复注册）。"""
+        from ..agents.implementations import (
+            backend_descriptor,
+            code_generation_descriptor,
+            code_review_descriptor,
+            data_analysis_descriptor,
+            frontend_descriptor,
+            game_dev_descriptor,
+            planning_descriptor,
+        )
+
+        agents = [
+            backend_descriptor(),
+            code_generation_descriptor(),
+            code_review_descriptor(),
+            data_analysis_descriptor(),
+            frontend_descriptor(),
+            game_dev_descriptor(),
+            planning_descriptor(),
+        ]
+
+        for agent in agents:
+            if agent.name not in registry._pools:
+                registry.register(agent)

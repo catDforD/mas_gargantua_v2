@@ -26,6 +26,14 @@ class ContextLayer(int, Enum):
     AGENT = 3
 
 
+class ContentCategory(str, Enum):
+    """内容类别：代码、文档或混合。"""
+
+    CODE = "code"
+    DOCUMENT = "document"
+    MIXED = "mixed"
+
+
 @dataclass
 class ContextEntry:
     """上下文条目，用于追踪运行时产生的关键数据。"""
@@ -44,6 +52,8 @@ class ContextEntry:
     is_compressed: bool = False
     original_length: int = 0
     summary: str | None = None
+    content_category: ContentCategory = ContentCategory.DOCUMENT
+    code_file_path: str | None = None
 
     def compute_score(self, current_task_id: str | None = None) -> float:
         """计算上下文条目的综合分数。
