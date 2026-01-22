@@ -7,6 +7,7 @@ from logging import Logger
 from typing import TYPE_CHECKING, final
 
 from ..agents.pool import AgentPoolRegistry
+from ..context.manager import ContextManager
 from ..core.schemas import (
     ExecutionContext,
     HookContext,
@@ -21,8 +22,8 @@ from ..hooks.manager import HookManager
 from ..llm.client import LLMClient
 from ..logging.events import LogEvent
 from ..logging.tracker import ExecutionTracker
-from ..utils.logger import get_logger
 from ..permissions.manager import PermissionManager
+from ..utils.logger import get_logger
 from .runner import TaskRunner
 from .scheduler import TaskScheduler
 
@@ -44,6 +45,7 @@ class ExecutionEngine:
     verbose: bool
     tracker: ExecutionTracker
     _logger: Logger
+    context_manager: ContextManager
 
     def __init__(
         self,
@@ -53,6 +55,7 @@ class ExecutionEngine:
         scheduler: TaskScheduler | None = None,
         runner: TaskRunner | None = None,
         verbose: bool = False,
+        context_max_tokens: int = 8000,
     ) -> None:
         llm_client = llm_client or LLMClient()
         hook_manager = hook_manager or HookManager()
@@ -74,6 +77,11 @@ class ExecutionEngine:
         self.verbose: bool = verbose
         self.tracker: ExecutionTracker = tracker
         self._logger = logger
+        self.context_manager = ContextManager(
+            session_id=self._session_id,
+            llm_client=self.llm_client,
+            max_tokens=context_max_tokens,
+        )
 
     async def run(self, workflow: Workflow) -> WorkflowResult:
         """Execute the workflow and return results."""
@@ -122,7 +130,7 @@ class ExecutionEngine:
                 return_exceptions=True,
             )
 
-            for task, result in zip(ready_tasks, llm_results):
+            for task, result in zip(ready_tasks, llm_results, strict=True):
                 if isinstance(result, Exception):
                     error_msg = str(result)
                     end_time = time.time()
@@ -226,14 +234,21 @@ class ExecutionEngine:
 
         # Execute LLM call
         try:
-            # Collect dependency outputs for context
-            dependency_outputs: dict[str, str] = {}
-            for dep_id in task.dependencies:
-                if dep_id in task_results and task_results[dep_id].output:
-                    dependency_outputs[dep_id] = str(task_results[dep_id].output)
+            # Get optimized context from ContextManager
+            optimized_context = await self.context_manager.get_context_for_task(
+                task_id=task.task_id,
+                dependency_ids=task.dependencies,
+                max_tokens=8000,
+            )
 
-            output = await self._call_llm(task, agent, dependency_outputs)
+            output = await self._call_llm(task, agent, optimized_context)
         except Exception as e:
+            # Store error context
+            await self.context_manager.add_error_context(
+                task_id=task.task_id,
+                error=str(e),
+                agent_name=agent_name,
+            )
             # Execute OnError hooks
             hook_result = await self.hook_manager.execute_on_error(hook_context)
             _ = hook_result
@@ -281,6 +296,13 @@ class ExecutionEngine:
             self.tracker.log_task_end(task.task_id, result)
             return result
 
+        # Store task output in context manager
+        await self.context_manager.add_task_output(
+            task_id=task.task_id,
+            output=str(output),
+            agent_name=agent_name,
+        )
+
         result = TaskResult(
             task_id=task.task_id,
             success=True,
@@ -297,14 +319,14 @@ class ExecutionEngine:
         self,
         task: Task,
         agent: AgentDescriptor | None,
-        dependency_outputs: dict[str, str],
+        context_str: str,
     ) -> str:
         """Call LLM with the task and agent configuration.
 
         Args:
             task: The task to execute
             agent: The agent descriptor (or None for default)
-            dependency_outputs: Outputs from dependency tasks for context
+            context_str: Pre-formatted context string
         """
         if agent:
             system_prompt = agent.system_prompt
@@ -317,23 +339,15 @@ class ExecutionEngine:
             temperature = 0.7
             agent_name = "default"
 
-        # Build context from dependency outputs
-        context_section = ""
-        if dependency_outputs:
-            context_parts = []
-            for dep_id, dep_output in dependency_outputs.items():
-                # Truncate very long outputs to avoid token limits
-                truncated = dep_output[:8000] if len(dep_output) > 8000 else dep_output
-                context_parts.append(f"### {dep_id} 任务的输出:\n{truncated}")
-            context_section = "\n\n## 前置任务的输出（请基于这些内容完成当前任务）:\n\n" + "\n\n".join(context_parts)
-
+        # Build prompt with pre-formatted context
         prompt = f"""System: {system_prompt}
-{context_section}
+
+{context_str}
 
 ## 当前任务:
 {task.objective}
 
-请基于前置任务的输出（如果有）完成当前任务，并提供你的回答。"""
+请基于上述上下文（如果有）完成当前任务，并提供你的回答。"""
 
         self.tracker.log_llm_request(task.task_id, agent_name, prompt)
         try:

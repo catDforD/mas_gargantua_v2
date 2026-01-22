@@ -1,8 +1,12 @@
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Callable
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from ..context.manager import ContextManager
 
 
 class AgentCapability(str, Enum):
@@ -175,3 +179,26 @@ class ExecutionContext:
     plan_id: str | None = None
     results: dict[str, object] = field(default_factory=dict)
     errors: dict[str, str] = field(default_factory=dict)
+    _context_manager: ContextManager | None = field(default=None, repr=False)
+
+    def get_context_manager(self) -> ContextManager:
+        """获取上下文管理器，如果不存在则创建一个新的。
+
+        Returns:
+            ContextManager: 上下文管理器实例。
+        """
+
+        if self._context_manager is None:
+            from ..context.manager import ContextManager
+
+            self._context_manager = ContextManager(self.session_id)
+        return self._context_manager
+
+    def set_context_manager(self, manager: ContextManager) -> None:
+        """设置上下文管理器。
+
+        Args:
+            manager: 要设置的上下文管理器实例。
+        """
+
+        self._context_manager = manager
